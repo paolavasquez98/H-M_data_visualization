@@ -1,33 +1,33 @@
 """
-H&M Fashion Intelligence Dashboard  v3
+H&M Fashion Intelligence — Cascade Storytelling Dashboard 
 ──────────────────────────────────────────────────────────────────────────────
-Analyst-grade BI layout:
-  • Four global slicers (product line, age group, year range)
-  • KPI summary row (updates with every filter change)
-  • Per-chart sort controls (channel bar, heatmap columns)
-  • Crossfilter: click an age-row in the left heatmap → right heatmap drills in
-  • Minimal text — charts and interactions do the explaining
+Analytical flow:
 
-Run: python app.py  →  http://127.0.0.1:8050
+  Step 1  WHO?
+  Step 2  WHAT?
+  Step 3  COLOUR?
+  Step 4  PRICE?
 
-to share, in naother terminal, run:
-ngrok http 8050
+Run:  python app.py   →   http://127.0.0.1:8050
 """
 
-import os
+import os, json
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-import plotly.express as px
-from dash import Dash, dcc, html, Input, Output, callback_context
+from dash import (Dash, dcc, html, Input, Output, State,
+                  ALL, callback_context, no_update)
 
-# ── paths ─────────────────────────────────────────────────────────────────────
+# ── constants ──────────────────────────────────────────────────────────────────
 BASE     = os.path.dirname(__file__)
 ART_PATH = os.path.join(BASE, "articles.csv")
 CUS_PATH = os.path.join(BASE, "customers.csv")
 TX_PATH  = os.path.join(BASE, "transactions_train.csv")
 
-# ── palette ───────────────────────────────────────────────────────────────────
+RED  = "#E10028"
+GREY = "#DDDDDD"
+BG   = "#F2F2F2"
+
 INDEX_COLORS = {
     "Baby/Children": "#FF9F9F",
     "Divided":       "#E8AC00",
@@ -39,23 +39,54 @@ INDEX_GROUPS = list(INDEX_COLORS.keys())
 AGE_BINS     = [15, 25, 35, 45, 55, 65, 100]
 AGE_LABELS   = ["15-24", "25-34", "35-44", "45-54", "55-64", "65+"]
 
-# ── load ──────────────────────────────────────────────────────────────────────
+# Colour hex mapping for Step 3 bars
+COLOUR_MAP = {
+    "Black":        "#1a1a1a",
+    "White":        "#f5f5f5",
+    "Grey":         "#888888",
+    "Dark Blue":    "#003087",
+    "Blue":         "#4169E1",
+    "Light Blue":   "#add8e6",
+    "Red":          "#E10028",
+    "Pink":         "#FFB6C1",
+    "Beige":        "#f5f0e1",
+    "Brown":        "#8B4513",
+    "Dark Green":   "#1a5c2a",
+    "Green":        "#3cb371",
+    "Yellow":       "#FFD700",
+    "Orange":       "#FF8C00",
+    "Purple":       "#6A0DAD",
+    "Lilac Purple": "#C8A2C8",
+    "Turquoise":    "#40E0D0",
+    "Khaki green":  "#8B864E",
+    "Mole":         "#7d6b5d",
+    "Rust":         "#B7410E",
+    "Gold":         "#FFD700",
+    "Silver":       "#C0C0C0",
+    "Transparent":  "#e0e0e0",
+    "Other":        "#d3d3d3",
+}
+# Light colours that need a border to be visible on white background
+LIGHT_COLOURS = {"White", "Beige", "Yellow", "Pink", "Light Blue", "Silver", "Transparent", "Other"}
+
+# ── load & merge ───────────────────────────────────────────────────────────────
 print("Loading data ...")
 art  = pd.read_csv(ART_PATH, usecols=["article_id", "index_group_name",
+                                       "garment_group_name",
                                        "perceived_colour_master_name"])
 cust = pd.read_csv(CUS_PATH, usecols=["customer_id", "age"])
-tx   = pd.read_csv(TX_PATH,  parse_dates=["t_dat"],
+tx   = pd.read_csv(TX_PATH, parse_dates=["t_dat"],
                    usecols=["t_dat", "customer_id", "article_id",
                             "price", "sales_channel_id"])
 tx = tx.merge(art,  on="article_id",  how="left")
 tx = tx.merge(cust, on="customer_id", how="left")
-print(f"Rows: {len(tx):,}")
+print(f"Rows after merge: {len(tx):,}")
 
 tx["age_bin"] = pd.cut(tx["age"], bins=AGE_BINS, labels=AGE_LABELS, right=False)
 tx["month"]   = tx["t_dat"].dt.to_period("M").dt.to_timestamp()
 tx["year"]    = tx["t_dat"].dt.year.astype(int)
 
-tx_c = tx.dropna(subset=["age_bin", "index_group_name"]).copy()
+tx_c = tx.dropna(subset=["age_bin", "index_group_name", "garment_group_name"]).copy()
 tx_c = tx_c[tx_c["index_group_name"].isin(INDEX_GROUPS)]
 
 yr_min = int(tx_c["year"].min())
@@ -65,535 +96,729 @@ yr_max = int(tx_c["year"].max())
 top_colors = (tx_c.dropna(subset=["perceived_colour_master_name"])
                    .groupby("perceived_colour_master_name")
                    .size().nlargest(12).index.tolist())
-tx_col = tx_c.dropna(subset=["perceived_colour_master_name"])
-tx_col = tx_col[tx_col["perceived_colour_master_name"].isin(top_colors)]
+tx_col = (tx_c[tx_c["perceived_colour_master_name"].isin(top_colors)]
+              .dropna(subset=["perceived_colour_master_name"]))
 
-# ── pre-aggregations ──────────────────────────────────────────────────────────
-# Fine-grained: all grouping dimensions, year included → callbacks just filter.
+# ── pre-aggregations (all callbacks filter these, never rescan raw data) ───────
 
-g_age_idx = (tx_c.groupby(["age_bin", "index_group_name", "year"], observed=True)
-               .size().reset_index(name="count"))
+# Age tile counts (static, for tile subtitles)
+age_total_counts = (tx_c.groupby("age_bin", observed=True).size()
+                        .reindex(AGE_LABELS, fill_value=0))
 
-g_age_color = (tx_col.groupby(
-                   ["age_bin", "perceived_colour_master_name",
-                    "index_group_name", "year"], observed=True)
-               .size().reset_index(name="count"))
+# Step 2 — garment counts
+g_garm = (tx_c.groupby(
+    ["age_bin", "garment_group_name", "index_group_name", "year"], observed=True)
+    .size().reset_index(name="count"))
 
-g_monthly = (tx_c.groupby(["month", "index_group_name"])
-               .size().reset_index(name="count"))
-# year extracted from month in callbacks
+# Step 3 — colour counts + median price (restricted to top_colors)
+g_col = (tx_col.groupby(
+    ["age_bin", "garment_group_name", "perceived_colour_master_name",
+     "index_group_name", "year"], observed=True)
+    .agg(count=("price", "size"), med_price=("price", "median"))
+    .reset_index())
+g_col["med_price"] = g_col["med_price"] * 100   # scale ×100 for display
 
-g_channel = (tx_c.groupby(["index_group_name", "sales_channel_id", "year"])
-               .size().reset_index(name="count"))
+# Step 4a — price percentiles WITHOUT colour dimension
+def _price_pct(grp_cols, src=None):
+    src = src if src is not None else tx_c
+    pq  = (src.groupby(grp_cols, observed=True)["price"]
+              .describe(percentiles=[0.1, 0.25, 0.5, 0.75, 0.9])
+              .reset_index())
+    pq.columns = list(grp_cols) + ["cnt","mean","std","pmin",
+                                    "p10","p25","p50","p75","p90","pmax"]
+    for col in ["p10","p25","p50","p75","p90"]:
+        pq[col] = pq[col] * 100          # scale to ×100 for readability
+    return pq
 
-g_summ = (tx_c.groupby(["index_group_name", "year"])
-            .agg(count=("article_id", "count"),
-                 total_price=("price", "sum"))
-            .reset_index())
+g_price_nc = _price_pct(
+    ["age_bin", "garment_group_name", "index_group_name", "year"])
+g_price_wc = _price_pct(
+    ["age_bin", "garment_group_name", "perceived_colour_master_name",
+     "index_group_name", "year"],
+    src=tx_col)
+
+# Trend — month × age × garment × line
+g_trend = (tx_c.groupby(
+    ["month", "age_bin", "garment_group_name", "index_group_name"], observed=True)
+    .size().reset_index(name="count"))
+
+# KPIs — age × line × year
+g_kpi = (tx_c.groupby(["age_bin", "index_group_name", "year"], observed=True)
+         .agg(count=("article_id", "count"), total_price=("price", "sum"))
+         .reset_index())
 
 print("Pre-aggregation done.")
 
-# ── helpers ───────────────────────────────────────────────────────────────────
+# ── layout helpers ─────────────────────────────────────────────────────────────
 
-def norm_pivot(piv, mode):
-    if mode == "row":
-        return piv.div(piv.sum(axis=1).replace(0, np.nan), axis=0) * 100
-    if mode == "col":
-        return piv.div(piv.sum(axis=0).replace(0, np.nan), axis=1) * 100
-    return piv
+def card(*children, **kw):
+    s = {"background": "white", "borderRadius": "10px",
+         "padding": "14px 18px", "boxShadow": "0 1px 5px rgba(0,0,0,0.07)"}
+    s.update(kw)
+    return html.Div(list(children), style=s)
 
+def step_hdr(num, text):
+    return html.Div([
+        html.Span(f"STEP {num}",
+                  style={"fontSize": "9px", "color": "#BBB",
+                         "letterSpacing": "1.2px", "textTransform": "uppercase",
+                         "marginRight": "6px"}),
+        html.Span(text, style={"fontSize": "13px", "fontWeight": 700, "color": "#222"}),
+    ], style={"marginBottom": "10px"})
 
-def heatmap_fig(piv, colorscale, mode):
-    sfx  = "%" if mode != "raw" else ""
-    fmt  = ".1f" if mode != "raw" else ",.0f"
-    text = [[f"{v:{fmt}}{sfx}" for v in row] for row in piv.values]
-    fig  = go.Figure(go.Heatmap(
-        z=piv.values,
-        x=piv.columns.tolist(),
-        y=[str(r) for r in piv.index],
-        colorscale=colorscale,
-        text=text,
-        texttemplate="%{text}",
-        textfont={"size": 10},
-        hoverongaps=False,
-        hovertemplate="<b>%{y}</b> · %{x}: %{text}<extra></extra>",
-        colorbar=dict(thickness=10),
+def kpi_tile(kid, label):
+    return html.Div([
+        html.Div("—", id=kid,
+                 style={"fontSize": "24px", "fontWeight": 800,
+                        "color": RED, "lineHeight": 1}),
+        html.Div(label, style={"fontSize": "10px", "color": "#999",
+                               "marginTop": "4px", "textTransform": "uppercase",
+                               "letterSpacing": "0.6px"}),
+    ], style={"background": "white", "borderRadius": "8px", "padding": "14px 20px",
+              "boxShadow": "0 1px 4px rgba(0,0,0,0.07)", "flex": 1})
+
+def tile_style(selected):
+    return {
+        "padding": "14px 16px", "borderRadius": "8px", "cursor": "pointer",
+        "border": f"2px solid {RED if selected else 'transparent'}",
+        "background": RED if selected else "white",
+        "color": "white" if selected else "#333",
+        "textAlign": "center", "minWidth": "86px", "userSelect": "none",
+        "boxShadow": ("0 2px 8px rgba(225,0,40,0.3)" if selected
+                      else "0 1px 4px rgba(0,0,0,0.07)"),
+        "transition": "all 0.15s",
+    }
+
+def empty_fig(msg="No data for this selection"):
+    fig = go.Figure()
+    fig.add_annotation(text=msg, xref="paper", yref="paper",
+                       x=0.5, y=0.5, showarrow=False,
+                       font=dict(size=12, color="#BBBBBB"))
+    fig.update_layout(margin=dict(l=4,r=4,t=4,b=4),
+                      plot_bgcolor="white", paper_bgcolor="white")
+    return fig
+
+TRANSITION = dict(duration=300, easing="cubic-in-out")
+
+def hbar(cats, counts, selected=None, max_bars=18):
+    """Horizontal ranked bar chart; selected bar is red, others grey."""
+    df = (pd.DataFrame({"cat": cats, "n": counts})
+            .nlargest(max_bars, "n")
+            .sort_values("n"))
+    colors = [RED if c == selected else GREY for c in df["cat"]]
+    fig = go.Figure(go.Bar(
+        x=df["n"], y=df["cat"], orientation="h",
+        marker_color=colors,
+        hovertemplate="%{y}: %{x:,}<extra></extra>",
     ))
     fig.update_layout(
-        margin=dict(l=4, r=4, t=4, b=4),
-        xaxis=dict(tickangle=-30, title=None, tickfont=dict(size=10)),
+        margin=dict(l=4, r=8, t=4, b=4),
+        xaxis=dict(title=None, gridcolor="#EEE", showgrid=True,
+                   tickfont=dict(size=10)),
         yaxis=dict(title=None, tickfont=dict(size=11)),
         plot_bgcolor="white", paper_bgcolor="white",
+        bargap=0.25,
+        transition=TRANSITION,
     )
     return fig
 
+def colour_bar(cats, counts, med_prices, top_garments, selected=None, max_bars=12):
+    """
+    Horizontal bar chart for Step 3 — each bar is filled with the actual colour hex.
+    Selected bar gets a dark border. Light colours get a grey border.
+    Enriched hover shows count + median price + top garment.
+    """
+    df = (pd.DataFrame({
+            "cat": cats, "n": counts,
+            "med": med_prices, "top_gar": top_garments,
+          })
+          .nlargest(max_bars, "n")
+          .sort_values("n"))
 
-def triggered_id():
-    """Returns the component id that fired the current callback (compatible API)."""
-    ctx = callback_context
-    if not ctx.triggered:
-        return None
-    return ctx.triggered[0]["prop_id"].split(".")[0]
+    bar_colors      = []
+    line_colors     = []
+    line_widths     = []
 
+    for c in df["cat"]:
+        hex_fill = COLOUR_MAP.get(c, "#AAAAAA")
+        bar_colors.append(hex_fill)
+        if c == selected:
+            line_colors.append("#333333")
+            line_widths.append(2)
+        elif c in LIGHT_COLOURS:
+            line_colors.append("#BBBBBB")
+            line_widths.append(1)
+        else:
+            line_colors.append(hex_fill)
+            line_widths.append(0)
 
-# ── layout primitives ─────────────────────────────────────────────────────────
+    customdata = list(zip(df["med"].round(2), df["top_gar"]))
 
-def card(*children, **style_extra):
-    s = {"background": "white", "borderRadius": "10px",
-         "padding": "12px 16px", "boxShadow": "0 1px 5px rgba(0,0,0,0.07)"}
-    s.update(style_extra)
-    return html.Div(list(children), style=s)
+    fig = go.Figure(go.Bar(
+        x=df["n"], y=df["cat"], orientation="h",
+        marker_color=bar_colors,
+        marker_line_color=line_colors,
+        marker_line_width=line_widths,
+        customdata=customdata,
+        hovertemplate=(
+            "<b>%{y}</b><br>"
+            "Transactions: %{x:,}<br>"
+            "Median price: x%{customdata[0]:.2f}<br>"
+            "Top garment: %{customdata[1]}"
+            "<extra></extra>"
+        ),
+    ))
+    fig.update_layout(
+        margin=dict(l=4, r=8, t=4, b=4),
+        xaxis=dict(title=None, gridcolor="#EEE", showgrid=True,
+                   tickfont=dict(size=10)),
+        yaxis=dict(title=None, tickfont=dict(size=11)),
+        plot_bgcolor="white", paper_bgcolor="white",
+        bargap=0.25,
+        transition=TRANSITION,
+    )
+    return fig
 
-
-def kpi_tile(kpi_id, label):
-    return html.Div([
-        html.Div("—", id=kpi_id,
-                 style={"fontSize": "24px", "fontWeight": 800,
-                        "color": "#E10028", "lineHeight": 1}),
-        html.Div(label,
-                 style={"fontSize": "10px", "color": "#999", "marginTop": "4px",
-                        "textTransform": "uppercase", "letterSpacing": "0.6px"}),
-    ], style={"background": "white", "borderRadius": "8px", "padding": "14px 20px",
-              "boxShadow": "0 1px 4px rgba(0,0,0,0.07)", "flex": 1, "minWidth": "120px"})
-
-
-def chart_header(title, *controls):
-    """Title + inline controls (dropdowns / radios) in one row."""
-    return html.Div([
-        html.Span(title, style={"fontSize": "13px", "fontWeight": 700,
-                                "color": "#222", "marginRight": "12px"}),
-        *controls,
-    ], style={"display": "flex", "alignItems": "center",
-              "flexWrap": "wrap", "marginBottom": "8px", "gap": "8px"})
-
-
-def mini_radio(id_, options, value):
-    return dcc.RadioItems(id=id_, options=options, value=value, inline=True,
-                          style={"fontSize": "11px", "color": "#555"},
-                          inputStyle={"marginRight": "3px"},
-                          labelStyle={"marginRight": "10px"})
-
-
-def mini_drop(id_, options, value, width=160):
-    return dcc.Dropdown(id=id_, options=options, value=value,
-                        clearable=False,
-                        style={"fontSize": "11px", "width": f"{width}px"})
-
-
-# ── option sets ───────────────────────────────────────────────────────────────
-NORM = [{"label": "% of age",      "value": "row"},
-        {"label": "% of category", "value": "col"},
-        {"label": "Count",         "value": "raw"}]
-
-SORT_COLS = [{"label": "Sort cols: volume",    "value": "vol"},
-             {"label": "Sort cols: A→Z",        "value": "alpha"}]
-
-SORT_CH   = [{"label": "Most online first",   "value": "online"},
-             {"label": "Most in-store first", "value": "store"},
-             {"label": "Alphabetical",        "value": "name"}]
-
-SORT_ROWS = [{"label": "Sort rows: age ↑",    "value": "age"},
-             {"label": "Sort rows: volume ↓", "value": "vol"}]
-
-# ── app ───────────────────────────────────────────────────────────────────────
+# ── app ────────────────────────────────────────────────────────────────────────
 app = Dash(__name__, title="H&M Fashion Intelligence")
+
+ALL_AGES = ["All"] + AGE_LABELS
+
+# Build age tile children with static counts baked in
+def _age_tile_children(a):
+    if a == "All":
+        total = age_total_counts.sum()
+        count_str = f"{total/1e6:.1f}M"
+        sub = "all ages"
+    else:
+        total = age_total_counts.get(a, 0)
+        count_str = f"{total/1e6:.1f}M" if total >= 1_000_000 else f"{total/1e3:.0f}k"
+        sub = "yrs"
+    return [
+        html.Div(a, style={"fontSize": "16px", "fontWeight": 700}),
+        html.Div(sub, style={"fontSize": "10px", "opacity": 0.6, "marginTop": "2px"}),
+        html.Div(count_str, style={"fontSize": "9px", "opacity": 0.5, "marginTop": "1px"}),
+    ]
 
 app.layout = html.Div([
 
-    # ── Slicer bar ────────────────────────────────────────────────────────────
+    # Cascade state: single source of truth for steps 1-3
+    dcc.Store(id="cascade", data={"age": None, "garment": None, "color": None}),
+
+    # ── top slicer bar ──────────────────────────────────────────────────────────
     html.Div([
-        # Brand
         html.Div([
-            html.Span("H&M", style={"color": "#E10028", "fontWeight": 900,
+            html.Span("H&M", style={"color": RED, "fontWeight": 900,
                                     "fontSize": "20px", "marginRight": "6px"}),
             html.Span("Fashion Intelligence",
                       style={"color": "#333", "fontWeight": 300, "fontSize": "18px"}),
-        ], style={"whiteSpace": "nowrap"}),
-
-        # Product line
+        ]),
         html.Div([
             html.Label("Product line",
                        style={"fontSize": "10px", "color": "#999", "display": "block",
                               "textTransform": "uppercase", "letterSpacing": "0.5px",
                               "marginBottom": "3px"}),
-            dcc.Dropdown(
-                id="slicer-lines",
-                options=[{"label": g, "value": g} for g in INDEX_GROUPS],
-                value=INDEX_GROUPS, multi=True, clearable=False,
-                style={"fontSize": "12px", "minWidth": "260px"},
-            ),
+            dcc.Dropdown(id="sl-lines",
+                         options=[{"label": g, "value": g} for g in INDEX_GROUPS],
+                         value=INDEX_GROUPS, multi=True, clearable=False,
+                         style={"fontSize": "12px", "minWidth": "280px"}),
         ]),
-
-        # Age group
-        html.Div([
-            html.Label("Age group",
-                       style={"fontSize": "10px", "color": "#999", "display": "block",
-                              "textTransform": "uppercase", "letterSpacing": "0.5px",
-                              "marginBottom": "3px"}),
-            dcc.Dropdown(
-                id="slicer-age",
-                options=[{"label": a, "value": a} for a in AGE_LABELS],
-                value=AGE_LABELS, multi=True, clearable=False,
-                style={"fontSize": "12px", "minWidth": "220px"},
-            ),
-        ]),
-
-        # Year range
         html.Div([
             html.Label("Year range",
                        style={"fontSize": "10px", "color": "#999", "display": "block",
                               "textTransform": "uppercase", "letterSpacing": "0.5px",
                               "marginBottom": "3px"}),
-            dcc.RangeSlider(
-                id="slicer-year",
-                min=yr_min, max=yr_max, step=1,
-                value=[yr_min, yr_max],
-                marks={y: str(y) for y in range(yr_min, yr_max + 1)},
-                tooltip={"placement": "bottom", "always_visible": False},
-            ),
+            dcc.RangeSlider(id="sl-year", min=yr_min, max=yr_max, step=1,
+                            value=[yr_min, yr_max],
+                            marks={y: str(y) for y in range(yr_min, yr_max + 1)},
+                            tooltip={"placement": "bottom", "always_visible": False}),
         ], style={"minWidth": "200px"}),
-
-        # Hint
-        html.Div("Click an age row in the left heatmap to drill into colours →",
-                 style={"fontSize": "10px", "color": "#BBB", "fontStyle": "italic",
-                        "whiteSpace": "nowrap", "marginLeft": "auto"}),
-
     ], style={
-        "display": "flex", "alignItems": "flex-end", "gap": "20px",
-        "padding": "12px 24px",
-        "background": "white",
-        "borderBottom": "3px solid #E10028",
+        "display": "flex", "alignItems": "flex-end", "gap": "24px",
+        "padding": "12px 24px", "background": "white",
+        "borderBottom": f"3px solid {RED}",
         "boxShadow": "0 2px 8px rgba(0,0,0,0.07)",
-        "position": "sticky", "top": 0, "zIndex": 999,
-        "flexWrap": "wrap",
+        "position": "sticky", "top": 0, "zIndex": 999, "flexWrap": "wrap",
     }),
 
-    # ── KPI row ───────────────────────────────────────────────────────────────
-    html.Div([
-        kpi_tile("kpi-tx",     "Transactions"),
-        kpi_tile("kpi-price",  "Avg price ×100"),
-        kpi_tile("kpi-seg",    "Top segment"),
-        kpi_tile("kpi-online", "Online share"),
-    ], style={"display": "flex", "gap": "10px", "padding": "12px 20px 0"}),
-
-    # ── Charts ────────────────────────────────────────────────────────────────
+    # ── main ───────────────────────────────────────────────────────────────────
     html.Div([
 
-        # Row 1 — two heatmaps
+        # KPI row
+        html.Div([
+            kpi_tile("kpi-tx",  "Transactions"),
+            kpi_tile("kpi-med", "Median price x100"),
+            kpi_tile("kpi-top", "Top product line"),
+        ], style={"display": "flex", "gap": "10px", "marginBottom": "12px"}),
+
+        # Breadcrumb strip — sticky below header
+        html.Div([
+            html.Span("Path: ", style={"fontSize": "11px", "color": "#BBB",
+                                       "marginRight": "4px"}),
+            html.Span(id="bc-age", n_clicks=0,
+                      style={"fontSize": "12px", "cursor": "pointer", "color": "#888"}),
+            html.Span(id="bc-sep1", children=" > ",
+                      style={"fontSize": "12px", "color": "#CCC", "display": "none"}),
+            html.Span(id="bc-gar", n_clicks=0,
+                      style={"fontSize": "12px", "cursor": "pointer",
+                             "color": RED, "fontWeight": 600, "display": "none"}),
+            html.Span(id="bc-sep2", children=" > ",
+                      style={"fontSize": "12px", "color": "#CCC", "display": "none"}),
+            html.Span(id="bc-col", n_clicks=0,
+                      style={"fontSize": "12px", "cursor": "pointer",
+                             "color": RED, "fontWeight": 600, "display": "none"}),
+            html.Span(id="bc-end", children=" > price breakdown",
+                      style={"fontSize": "12px", "color": "#BBB",
+                             "fontStyle": "italic", "display": "none"}),
+            html.Span(" (click a segment to reset from that point)",
+                      style={"fontSize": "10px", "color": "#CCC",
+                             "marginLeft": "8px", "fontStyle": "italic"}),
+            # Reset all button
+            html.Button("✕ Reset all", id="btn-reset-all", n_clicks=0,
+                        style={
+                            "marginLeft": "auto", "fontSize": "11px",
+                            "color": "#999", "background": "none",
+                            "border": "1px solid #DDD", "borderRadius": "4px",
+                            "padding": "2px 10px", "cursor": "pointer",
+                        }),
+        ], style={
+            "display": "flex", "alignItems": "center", "flexWrap": "wrap",
+            "padding": "6px 14px", "background": "white", "borderRadius": "8px",
+            "boxShadow": "0 1px 3px rgba(0,0,0,0.05)",
+            "marginBottom": "12px",
+            "position": "sticky", "top": "74px", "zIndex": 998,
+        }),
+
+        # Step 1 — age tiles
+        card(
+            step_hdr(1, "Who is buying?"),
+            html.Div([
+                html.Div(
+                    _age_tile_children(a),
+                    id={"type": "age-tile", "index": a},
+                    n_clicks=0,
+                    style=tile_style(a == "All"),
+                )
+                for a in ALL_AGES
+            ], style={"display": "flex", "gap": "8px", "flexWrap": "wrap"}),
+            marginBottom="12px",
+        ),
+
+        # Steps 2, 3, 4 — side by side
         html.Div([
             card(
-                chart_header(
-                    "Purchases · Age × Product line",
-                    mini_radio("norm1", NORM, "row"),
-                    mini_drop("sort1-cols", SORT_COLS, "vol", 160),
-                    mini_drop("sort1-rows", SORT_ROWS, "age", 155),
-                ),
-                dcc.Graph(id="heatmap-cat",
-                          config={"displayModeBar": False},
-                          style={"height": "275px"}),
+                step_hdr(2, "What garment type?"),
+                html.Div("Click a bar to filter colour and price",
+                         style={"fontSize": "10px", "color": "#BBB",
+                                "marginBottom": "6px", "fontStyle": "italic"}),
+                dcc.Loading(type="dot", color=RED, children=[
+                    dcc.Graph(id="garm-chart", config={"displayModeBar": False},
+                              style={"height": "380px"}),
+                ]),
                 flex="1",
             ),
             card(
-                chart_header(
-                    "Colour palette · Age × Master tone",
-                    mini_radio("norm2", NORM, "row"),
-                    mini_drop("sort2-cols", SORT_COLS, "vol", 160),
-                    mini_drop("sort2-rows", SORT_ROWS, "age", 155),
-                ),
-                dcc.Graph(id="heatmap-color",
-                          config={"displayModeBar": False},
-                          style={"height": "275px"}),
+                step_hdr(3, "Which colour?"),
+                html.Div("Click a bar to lock in the price view",
+                         style={"fontSize": "10px", "color": "#BBB",
+                                "marginBottom": "6px", "fontStyle": "italic"}),
+                dcc.Loading(type="dot", color=RED, children=[
+                    dcc.Graph(id="col-chart", config={"displayModeBar": False},
+                              style={"height": "380px"}),
+                ]),
+                flex="1",
+            ),
+            card(
+                step_hdr(4, "At what price?"),
+                html.Div("Price distribution by product line for the active selection",
+                         style={"fontSize": "10px", "color": "#BBB",
+                                "marginBottom": "6px", "fontStyle": "italic"}),
+                dcc.Loading(type="dot", color=RED, children=[
+                    dcc.Graph(id="price-chart", config={"displayModeBar": False},
+                              style={"height": "360px"}),
+                ]),
+                html.Div("Whiskers show the P10–P90 range. Extreme outliers (top/bottom 10%) "
+                         "are excluded to focus on typical pricing.",
+                         style={"fontSize": "9px", "color": "#CCC",
+                                "marginTop": "6px", "fontStyle": "italic"}),
                 flex="1",
             ),
         ], style={"display": "flex", "gap": "12px", "marginBottom": "12px"}),
 
-        # Row 2 — trend (full width)
+        # Trend — context panel
         card(
-            chart_header("Monthly sales · indexed to period start  (100 = baseline)"),
-            dcc.Graph(id="trend-chart",
-                      config={"displayModeBar": False},
-                      style={"height": "240px"}),
-            marginBottom="12px",
+            html.Div("Sales trend — monthly index for current selection  "
+                     "(100 = first month in range)",
+                     style={"fontSize": "12px", "fontWeight": 600, "color": "#555",
+                            "marginBottom": "8px"}),
+            dcc.Loading(type="dot", color=RED, children=[
+                dcc.Graph(id="trend-chart", config={"displayModeBar": False},
+                          style={"height": "220px"}),
+            ]),
         ),
 
-        # Row 3 — channel + bubble
-        html.Div([
-            card(
-                chart_header(
-                    "Channel mix · Store vs Online",
-                    mini_drop("sort-ch", SORT_CH, "online", 175),
-                ),
-                dcc.Graph(id="channel-chart",
-                          config={"displayModeBar": False},
-                          style={"height": "240px"}),
-                flex="1",
-            ),
-            card(
-                chart_header("Revenue landscape · price × volume (bubble = revenue)"),
-                dcc.Graph(id="bubble-chart",
-                          config={"displayModeBar": False},
-                          style={"height": "240px"}),
-                flex="1",
-            ),
-        ], style={"display": "flex", "gap": "12px"}),
-
-    ], style={"padding": "12px 20px", "background": "#F2F2F2",
-              "minHeight": "calc(100vh - 120px)"}),
+    ], style={"padding": "12px 20px", "background": BG,
+              "minHeight": "calc(100vh - 74px)"}),
 
 ], style={"fontFamily": "'Segoe UI', system-ui, -apple-system, sans-serif",
           "margin": 0, "padding": 0})
 
 
-# ── callbacks ─────────────────────────────────────────────────────────────────
+# ── callbacks ──────────────────────────────────────────────────────────────────
 
+def _triggered():
+    ctx = callback_context
+    return ctx.triggered[0]["prop_id"] if ctx.triggered else ""
+
+
+# 1. Cascade state — single callback handles every possible trigger ─────────────
 @app.callback(
-    [Output("kpi-tx", "children"),
-     Output("kpi-price", "children"),
-     Output("kpi-seg", "children"),
-     Output("kpi-online", "children")],
-    [Input("slicer-lines", "value"),
-     Input("slicer-age",   "value"),
-     Input("slicer-year",  "value")],
+    Output("cascade", "data"),
+    [Input({"type": "age-tile", "index": ALL}, "n_clicks"),
+     Input("garm-chart",    "clickData"),
+     Input("col-chart",     "clickData"),
+     Input("bc-age",        "n_clicks"),
+     Input("bc-gar",        "n_clicks"),
+     Input("bc-col",        "n_clicks"),
+     Input("btn-reset-all", "n_clicks")],
+    State("cascade", "data"),
+    prevent_initial_call=True,
 )
-def update_kpis(lines, ages, yr):
-    lines = lines or INDEX_GROUPS
-    ages  = ages  or AGE_LABELS
+def update_cascade(age_clicks, gar_click, col_click,
+                   _bca, _bcg, _bcc, _reset, current):
+    t = _triggered()
+    c = current or {"age": None, "garment": None, "color": None}
+
+    # Reset all
+    if "btn-reset-all" in t:
+        return {"age": None, "garment": None, "color": None}
+
+    # Age tile clicked
+    if "age-tile" in t:
+        sel     = json.loads(t.split(".")[0])["index"]
+        new_age = None if sel == "All" else sel
+        return {"age": new_age, "garment": None, "color": None}
+
+    # Garment bar clicked (toggle: click selected bar again to deselect)
+    if "garm-chart.clickData" in t and gar_click:
+        val     = gar_click["points"][0]["y"]
+        new_gar = None if c.get("garment") == val else val
+        return {**c, "garment": new_gar, "color": None}
+
+    # Colour bar clicked (toggle)
+    if "col-chart.clickData" in t and col_click:
+        val     = col_click["points"][0]["y"]
+        new_col = None if c.get("color") == val else val
+        return {**c, "color": new_col}
+
+    # Breadcrumb resets
+    if "bc-age" in t:
+        return {"age": None, "garment": None, "color": None}
+    if "bc-gar" in t:
+        return {**c, "garment": None, "color": None}
+    if "bc-col" in t:
+        return {**c, "color": None}
+
+    return no_update
+
+
+# 2. Age tile visual highlight ─────────────────────────────────────────────────
+@app.callback(
+    Output({"type": "age-tile", "index": ALL}, "style"),
+    Input("cascade", "data"),
+    State({"type": "age-tile", "index": ALL}, "id"),
+)
+def update_tile_styles(cascade, ids):
+    sel = (cascade or {}).get("age")          # None = "All" selected
+    return [
+        tile_style((i["index"] == "All" and sel is None) or i["index"] == sel)
+        for i in ids
+    ]
+
+
+# 3. Breadcrumb ────────────────────────────────────────────────────────────────
+@app.callback(
+    [Output("bc-age",  "children"), Output("bc-age",  "style"),
+     Output("bc-sep1", "style"),
+     Output("bc-gar",  "children"), Output("bc-gar",  "style"),
+     Output("bc-sep2", "style"),
+     Output("bc-col",  "children"), Output("bc-col",  "style"),
+     Output("bc-end",  "style")],
+    Input("cascade", "data"),
+)
+def update_breadcrumb(cascade):
+    c   = cascade or {}
+    age = c.get("age")
+    gar = c.get("garment")
+    col = c.get("color")
+
+    shown = {"fontSize": "12px", "display": "inline"}
+    hide  = {"display": "none"}
+
+    age_style = {**shown, "cursor": "pointer",
+                 "color": RED if age else "#888",
+                 "fontWeight": 700 if age else 400}
+    sep1  = {**shown, "color": "#CCC"} if gar else hide
+    gar_s = {**shown, "cursor": "pointer", "color": RED,
+             "fontWeight": 600} if gar else hide
+    sep2  = {**shown, "color": "#CCC"} if col else hide
+    col_s = {**shown, "cursor": "pointer", "color": RED,
+             "fontWeight": 600} if col else hide
+    end_s = {**shown, "color": "#BBB", "fontStyle": "italic"} if (age or gar or col) else hide
+
+    return (age or "All ages", age_style,
+            sep1,
+            gar or "", gar_s,
+            sep2,
+            col or "", col_s,
+            end_s)
+
+
+# 4. KPIs ──────────────────────────────────────────────────────────────────────
+@app.callback(
+    [Output("kpi-tx",  "children"),
+     Output("kpi-med", "children"),
+     Output("kpi-top", "children")],
+    [Input("cascade",  "data"),
+     Input("sl-lines", "value"),
+     Input("sl-year",  "value")],
+)
+def update_kpis(cascade, lines, yr):
+    lines  = lines or INDEX_GROUPS
+    c      = cascade or {}
+    age    = c.get("age")
     y0, y1 = yr
 
-    ds = g_summ[(g_summ["index_group_name"].isin(lines)) &
-                (g_summ["year"].between(y0, y1))]
-    total  = ds["count"].sum()
-    price  = ds["total_price"].sum() / max(total, 1) * 100
-    top    = ds.groupby("index_group_name")["count"].sum().idxmax() if not ds.empty else "—"
+    df = g_kpi[(g_kpi["index_group_name"].isin(lines)) &
+               (g_kpi["year"].between(y0, y1))]
+    if age:
+        df = df[df["age_bin"] == age]
 
-    ch = g_channel[(g_channel["index_group_name"].isin(lines)) &
-                   (g_channel["year"].between(y0, y1))]
-    ch_total  = ch["count"].sum()
-    online_n  = ch[ch["sales_channel_id"] == 2]["count"].sum()
-    online_pct = online_n / max(ch_total, 1) * 100
+    total = int(df["count"].sum())
+    top   = (df.groupby("index_group_name")["count"].sum().idxmax()
+             if not df.empty else "—")
 
-    return (f"{total/1e6:.1f}M",
-            f"×{price:.2f}",
-            top,
-            f"{online_pct:.0f}%")
+    pf = g_price_nc[(g_price_nc["index_group_name"].isin(lines)) &
+                    (g_price_nc["year"].between(y0, y1))]
+    if age:
+        pf = pf[pf["age_bin"] == age]
+    med = pf["p50"].median() if not pf.empty else 0.0
+
+    tx_label = f"{total/1e6:.1f}M" if total >= 1_000_000 else f"{total:,}"
+    return tx_label, f"x{med:.2f}", top
 
 
+# 5. Step 2 — garment bar ──────────────────────────────────────────────────────
 @app.callback(
-    Output("heatmap-cat", "figure"),
-    [Input("slicer-lines",  "value"),
-     Input("slicer-age",    "value"),
-     Input("slicer-year",   "value"),
-     Input("norm1",         "value"),
-     Input("sort1-cols",    "value"),
-     Input("sort1-rows",    "value")],
+    Output("garm-chart", "figure"),
+    [Input("cascade",  "data"),
+     Input("sl-lines", "value"),
+     Input("sl-year",  "value")],
 )
-def update_cat(lines, ages, yr, norm, col_sort, row_sort):
-    lines = lines or INDEX_GROUPS
-    ages  = ages  or AGE_LABELS
+def update_garm(cascade, lines, yr):
+    lines  = lines or INDEX_GROUPS
+    c      = cascade or {}
+    age    = c.get("age")
     y0, y1 = yr
 
-    df  = g_age_idx[(g_age_idx["index_group_name"].isin(lines)) &
-                    (g_age_idx["age_bin"].isin(ages)) &
-                    (g_age_idx["year"].between(y0, y1))]
-    agg = (df.groupby(["age_bin", "index_group_name"], observed=True)["count"]
-             .sum().reset_index())
-    piv = (agg.pivot(index="age_bin", columns="index_group_name", values="count")
-              .fillna(0))
+    df = g_garm[(g_garm["index_group_name"].isin(lines)) &
+                (g_garm["year"].between(y0, y1))]
+    if age:
+        df = df[df["age_bin"] == age]
 
-    # sort rows
-    if row_sort == "vol":
-        row_order = piv.sum(axis=1).sort_values(ascending=False).index.tolist()
-    else:
-        row_order = [a for a in AGE_LABELS if a in piv.index]
-    piv = piv.reindex(row_order)
-
-    # sort cols
-    if col_sort == "alpha":
-        piv = piv[sorted(piv.columns)]
-    else:
-        piv = piv[piv.sum().sort_values(ascending=False).index]
-
-    return heatmap_fig(norm_pivot(piv, norm), "YlOrRd", norm)
-
-
-@app.callback(
-    Output("heatmap-color", "figure"),
-    [Input("slicer-lines",  "value"),
-     Input("slicer-age",    "value"),
-     Input("slicer-year",   "value"),
-     Input("norm2",         "value"),
-     Input("sort2-cols",    "value"),
-     Input("sort2-rows",    "value"),
-     Input("heatmap-cat",   "clickData")],   # ← crossfilter trigger
-)
-def update_color(lines, ages, yr, norm, col_sort, row_sort, click):
-    lines = lines or INDEX_GROUPS
-    ages  = ages  or AGE_LABELS
-    y0, y1 = yr
-
-    # Crossfilter: if the left heatmap row was clicked, override the age filter
-    if click and triggered_id() == "heatmap-cat":
-        ages = [click["points"][0]["y"]]
-
-    df  = g_age_color[(g_age_color["index_group_name"].isin(lines)) &
-                      (g_age_color["age_bin"].isin(ages)) &
-                      (g_age_color["year"].between(y0, y1))]
-    agg = (df.groupby(["age_bin", "perceived_colour_master_name"], observed=True)["count"]
-             .sum().reset_index())
-
+    agg = df.groupby("garment_group_name")["count"].sum().reset_index()
     if agg.empty:
-        return go.Figure()
+        return empty_fig()
 
-    piv = (agg.pivot(index="age_bin", columns="perceived_colour_master_name",
-                     values="count").fillna(0))
+    return hbar(agg["garment_group_name"], agg["count"],
+                selected=c.get("garment"))
 
-    # sort rows
-    if row_sort == "vol":
-        row_order = piv.sum(axis=1).sort_values(ascending=False).index.tolist()
+
+# 6. Step 3 — colour bar ───────────────────────────────────────────────────────
+@app.callback(
+    Output("col-chart", "figure"),
+    [Input("cascade",  "data"),
+     Input("sl-lines", "value"),
+     Input("sl-year",  "value")],
+)
+def update_col(cascade, lines, yr):
+    lines  = lines or INDEX_GROUPS
+    c      = cascade or {}
+    age    = c.get("age")
+    gar    = c.get("garment")
+    y0, y1 = yr
+
+    df = g_col[(g_col["index_group_name"].isin(lines)) &
+               (g_col["year"].between(y0, y1))]
+    if age:
+        df = df[df["age_bin"] == age]
+    if gar:
+        df = df[df["garment_group_name"] == gar]
+
+    if df.empty:
+        return empty_fig()
+
+    # Aggregate: sum count, weighted-avg median price, top garment per colour
+    agg_count = (df.groupby("perceived_colour_master_name")["count"]
+                   .sum().reset_index(name="count"))
+    agg_med   = (df.groupby("perceived_colour_master_name")
+                   .apply(lambda g: np.average(g["med_price"], weights=g["count"]))
+                   .reset_index(name="med_price"))
+    agg_top   = (df.groupby(["perceived_colour_master_name", "garment_group_name"])["count"]
+                   .sum().reset_index()
+                   .sort_values("count", ascending=False)
+                   .drop_duplicates("perceived_colour_master_name")
+                   [["perceived_colour_master_name", "garment_group_name"]]
+                   .rename(columns={"garment_group_name": "top_garment"}))
+
+    agg = (agg_count
+           .merge(agg_med,  on="perceived_colour_master_name")
+           .merge(agg_top,  on="perceived_colour_master_name", how="left"))
+    agg["top_garment"] = agg["top_garment"].fillna("—")
+
+    return colour_bar(
+        agg["perceived_colour_master_name"],
+        agg["count"],
+        agg["med_price"],
+        agg["top_garment"],
+        selected=c.get("color"),
+        max_bars=12,
+    )
+
+
+# 7. Step 4 — price box plot ───────────────────────────────────────────────────
+@app.callback(
+    Output("price-chart", "figure"),
+    [Input("cascade",  "data"),
+     Input("sl-lines", "value"),
+     Input("sl-year",  "value")],
+)
+def update_price(cascade, lines, yr):
+    lines  = lines or INDEX_GROUPS
+    c      = cascade or {}
+    age    = c.get("age")
+    gar    = c.get("garment")
+    col    = c.get("color")
+    y0, y1 = yr
+
+    if col:
+        df = g_price_wc[g_price_wc["perceived_colour_master_name"] == col].copy()
     else:
-        row_order = [a for a in AGE_LABELS if a in piv.index]
-    piv = piv.reindex(row_order)
+        df = g_price_nc.copy()
 
-    # sort cols
-    if col_sort == "alpha":
-        piv = piv[sorted(piv.columns)]
-    else:
-        piv = piv[piv.sum().sort_values(ascending=False).index]
+    df = df[(df["index_group_name"].isin(lines)) &
+            (df["year"].between(y0, y1))]
+    if age:
+        df = df[df["age_bin"] == age]
+    if gar:
+        df = df[df["garment_group_name"] == gar]
 
-    return heatmap_fig(norm_pivot(piv, norm), "RdPu", norm)
+    agg = (df.groupby("index_group_name")[["p10","p25","p50","p75","p90"]]
+             .median().reset_index())
+    if agg.empty:
+        return empty_fig()
+
+    fig = go.Figure()
+    for _, row in agg.iterrows():
+        grp = row["index_group_name"]
+        fig.add_trace(go.Box(
+            name=grp,
+            median=[row["p50"]],
+            q1=[row["p25"]],
+            q3=[row["p75"]],
+            lowerfence=[row["p10"]],
+            upperfence=[row["p90"]],
+            marker_color=INDEX_COLORS.get(grp, "#999"),
+            line_color=INDEX_COLORS.get(grp, "#999"),
+            showlegend=False,
+            boxpoints=False,
+        ))
+    fig.update_layout(
+        margin=dict(l=4, r=4, t=4, b=4),
+        yaxis=dict(title="Price (normalised x100)", gridcolor="#EEE",
+                   tickfont=dict(size=11)),
+        xaxis=dict(title=None, tickfont=dict(size=11)),
+        plot_bgcolor="white", paper_bgcolor="white",
+        transition=TRANSITION,
+    )
+    return fig
 
 
+# 8. Trend — context panel ─────────────────────────────────────────────────────
 @app.callback(
     Output("trend-chart", "figure"),
-    [Input("slicer-lines", "value"),
-     Input("slicer-year",  "value")],
+    [Input("cascade",  "data"),
+     Input("sl-lines", "value"),
+     Input("sl-year",  "value")],
 )
-def update_trend(lines, yr):
-    lines = lines or INDEX_GROUPS
+def update_trend(cascade, lines, yr):
+    lines  = lines or INDEX_GROUPS
+    c      = cascade or {}
+    age    = c.get("age")
+    gar    = c.get("garment")
     y0, y1 = yr
 
-    df = g_monthly[g_monthly["index_group_name"].isin(lines)].copy()
-    df = df[df["month"].dt.year.between(y0, y1)].sort_values("month")
+    df = g_trend[(g_trend["index_group_name"].isin(lines)) &
+                 (g_trend["month"].dt.year.between(y0, y1))]
+    if age:
+        df = df[df["age_bin"] == age]
+    if gar:
+        df = df[df["garment_group_name"] == gar]
+
+    monthly = (df.groupby(["month", "index_group_name"])["count"]
+                 .sum().reset_index())
+
+    # Find overall peak month for annotation
+    if not monthly.empty:
+        peak_m = monthly.groupby("month")["count"].sum().idxmax()
+    else:
+        peak_m = None
 
     fig = go.Figure()
     for grp in lines:
-        sub = df[df["index_group_name"] == grp].copy()
+        sub = monthly[monthly["index_group_name"] == grp].sort_values("month").copy()
         if sub.empty:
             continue
         base = sub.iloc[0]["count"]
         sub["idx"] = sub["count"] / base * 100 if base > 0 else sub["count"]
         fig.add_trace(go.Scatter(
-            x=sub["month"], y=sub["idx"], mode="lines", name=grp,
+            x=sub["month"], y=sub["idx"],
+            mode="lines", name=grp,
             line=dict(color=INDEX_COLORS.get(grp, "#999"), width=2.5),
-            hovertemplate=f"<b>{grp}</b>  %{{x|%b %Y}}  →  %{{y:.0f}}<extra></extra>",
+            hovertemplate=f"<b>{grp}</b>  %{{x|%b %Y}}: %{{y:.0f}}<extra></extra>",
         ))
+        # Peak annotation dot
+        if peak_m is not None:
+            peak_row = sub[sub["month"] == peak_m]
+            if not peak_row.empty:
+                peak_y = float(peak_row.iloc[0]["idx"])
+                fig.add_trace(go.Scatter(
+                    x=[peak_m], y=[peak_y],
+                    mode="markers+text",
+                    marker=dict(color=RED, size=8, symbol="circle"),
+                    text=[f"Peak<br>{peak_m.strftime('%b %Y')}"],
+                    textposition="top center",
+                    textfont=dict(size=9, color=RED),
+                    showlegend=False,
+                    hoverinfo="skip",
+                ))
 
-    fig.add_hline(y=100, line_dash="dot", line_color="#CCC",
-                  annotation_text="Baseline", annotation_position="bottom right",
-                  annotation_font=dict(size=9, color="#AAA"))
+    fig.add_hline(y=100, line_dash="dot", line_color="#DDD",
+                  annotation_text="Baseline",
+                  annotation_position="bottom right",
+                  annotation_font=dict(size=9, color="#BBB"))
     fig.update_layout(
         margin=dict(l=4, r=4, t=4, b=4),
         xaxis=dict(title=None, showgrid=False),
-        yaxis=dict(title="Sales index", gridcolor="#EEE"),
+        yaxis=dict(title="Sales index (100 = start of range)",
+                   gridcolor="#EEE"),
         legend=dict(orientation="h", y=1.05, x=0, font=dict(size=11)),
         plot_bgcolor="white", paper_bgcolor="white",
         hovermode="x unified",
-    )
-    return fig
-
-
-@app.callback(
-    Output("channel-chart", "figure"),
-    [Input("slicer-lines", "value"),
-     Input("slicer-year",  "value"),
-     Input("sort-ch",      "value")],
-)
-def update_channel(lines, yr, sort_by):
-    lines = lines or INDEX_GROUPS
-    y0, y1 = yr
-
-    ch  = g_channel[(g_channel["index_group_name"].isin(lines)) &
-                    (g_channel["year"].between(y0, y1))]
-    agg = ch.groupby(["index_group_name", "sales_channel_id"])["count"].sum().reset_index()
-    piv = (agg.pivot(index="index_group_name", columns="sales_channel_id",
-                     values="count").fillna(0))
-    for col in [1, 2]:
-        if col not in piv.columns:
-            piv[col] = 0
-    piv = piv.rename(columns={1: "Store", 2: "Online"})
-    piv["total"]   = piv["Store"] + piv["Online"]
-    piv["Online%"] = piv["Online"] / piv["total"] * 100
-    piv["Store%"]  = piv["Store"]  / piv["total"] * 100
-
-    if sort_by == "online":
-        piv = piv.sort_values("Online%", ascending=True)
-    elif sort_by == "store":
-        piv = piv.sort_values("Store%", ascending=True)
-    else:
-        piv = piv.sort_index()
-
-    fig = go.Figure()
-    fig.add_trace(go.Bar(
-        name="Store", y=piv.index, x=piv["Store%"],
-        orientation="h", marker_color="#1F4E79",
-        hovertemplate="<b>%{y}</b>  Store %{x:.1f}%<extra></extra>",
-    ))
-    fig.add_trace(go.Bar(
-        name="Online", y=piv.index, x=piv["Online%"],
-        orientation="h", marker_color="#E10028",
-        hovertemplate="<b>%{y}</b>  Online %{x:.1f}%<extra></extra>",
-    ))
-    fig.update_layout(
-        barmode="stack",
-        margin=dict(l=4, r=4, t=4, b=4),
-        xaxis=dict(range=[0, 100], ticksuffix="%",
-                   title="% of transactions", gridcolor="#EEE"),
-        yaxis=dict(title=None),
-        legend=dict(orientation="h", y=1.05, x=0, font=dict(size=11)),
-        plot_bgcolor="white", paper_bgcolor="white",
-    )
-    return fig
-
-
-@app.callback(
-    Output("bubble-chart", "figure"),
-    [Input("slicer-lines", "value"),
-     Input("slicer-year",  "value")],
-)
-def update_bubble(lines, yr):
-    lines = lines or INDEX_GROUPS
-    y0, y1 = yr
-
-    ds  = g_summ[(g_summ["index_group_name"].isin(lines)) &
-                 (g_summ["year"].between(y0, y1))]
-    agg = ds.groupby("index_group_name").agg(
-        count=("count", "sum"), total_price=("total_price", "sum")).reset_index()
-    agg["avg_price"] = agg["total_price"] / agg["count"].clip(lower=1) * 100
-
-    fig = px.scatter(
-        agg, x="avg_price", y="count",
-        size="total_price", color="index_group_name", text="index_group_name",
-        color_discrete_map=INDEX_COLORS, size_max=70,
-        custom_data=["total_price"],
-        labels={"avg_price": "Avg price ×100", "count": "Transactions",
-                "index_group_name": "Line"},
-    )
-    fig.update_traces(
-        textposition="top center",
-        marker=dict(sizemin=12, opacity=0.85, line=dict(width=1.5, color="white")),
-        hovertemplate=(
-            "<b>%{text}</b><br>"
-            "Price ×%{x:.2f}  |  Vol %{y:,}  |  Rev %{customdata[0]:,.0f}"
-            "<extra></extra>"
-        ),
-    )
-    fig.update_layout(
-        margin=dict(l=4, r=4, t=4, b=4), showlegend=False,
-        plot_bgcolor="white", paper_bgcolor="white",
-        xaxis=dict(gridcolor="#EEE"), yaxis=dict(gridcolor="#EEE"),
+        transition=TRANSITION,
     )
     return fig
 
 
 if __name__ == "__main__":
-    app.run(debug=True, port=8050)
+    app.run(debug=False)
